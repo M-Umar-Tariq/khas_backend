@@ -167,7 +167,7 @@ RCMS_DB = {
 }
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1")
 CHATBOT_MAX_RETRIES = int(os.environ.get("CHATBOT_MAX_RETRIES", "2"))
 CHATBOT_MAX_ROWS_TO_LLM = int(os.environ.get("CHATBOT_MAX_ROWS_TO_LLM", "50"))
 CHATBOT_SCHEMA_CACHE_TTL = int(os.environ.get("CHATBOT_SCHEMA_CACHE_TTL", "300"))

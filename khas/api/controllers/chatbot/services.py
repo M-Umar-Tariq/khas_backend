@@ -101,10 +101,26 @@ human-readable label, the primary metric, and at least one secondary metric
 that is only a list of IDs and one number is rarely the right answer.
 
 ═══ JOINING FOR NAMES ═══
-Whenever the result would contain a foreign-key-style column (anything that
-looks like an identifier — *_id, *_no, *_code), check the catalog for a related
-lookup table that holds a human-readable name or description, and JOIN to it.
-Show names, not raw IDs, wherever possible.
+When the user asks for a "name", "title", or "description", JOIN to the
+master/lookup table and select a column whose OWN name reads like a name
+(e.g. item_name, product_name, field_name, Description).
+Never substitute *_code, *_sku, *_id, *_no columns — those are still
+identifiers. If no such text column exists, return the IDs and say so.
+
+═══ FOLLOW-UP ENRICHMENT ═══
+If the user asks for ANY extra attribute about entities shown in the prior
+turn ("name", "description", "category", "address", "phone", "date", etc.),
+JOIN to the table that actually holds that attribute. Never substitute a
+different identifier column (a *_code, *_sku, *_no) when the user asked for
+a descriptive attribute. If the catalog truly has no such column for that
+entity, say so by returning only the original columns.
+
+When the prior turn's "Result of the SQL above" block is included, those are
+the exact entities the user means by "these" / "those" / "the items above".
+Filter the new query to those exact IDs by writing an IN clause that contains
+the literal numeric IDs copied from that preview (for example: WHERE
+Product_Item_ID IN (7909, 7903, 7902)). NEVER write angle-bracket
+placeholders like (the ids) or (id_col) — copy the real numbers in.
 
 ═══ TABLE SELECTION ═══
 Prefer the most populated table for the measure being requested. Detail or
@@ -602,12 +618,11 @@ def user_message_with_history(
     """Build history context and append the current message.
 
     Prior turns include user text, assistant answers, and (for database turns)
-    the SQL that was run — but never prior SQL result rows. Re-feeding result
-    data into later prompts is redundant once the assistant has answered and
-    blows up token usage.
+    the SQL that was run. The MOST RECENT database turn also includes a tiny
+    preview of its result rows — so a follow-up like "names of these items"
+    can pin "these" to the actual IDs instead of re-querying the whole table.
 
-    ``light=True`` (used by the cheap router call) omits SQL entirely and keeps
-    only the user/assistant text.
+    ``light=True`` (used by the cheap router call) omits SQL and rows.
     """
     if not conversation_id:
         return message
@@ -622,14 +637,19 @@ def user_message_with_history(
         return message
 
     lines = ["Previous conversation (oldest first):"]
+    ordered = list(reversed(turns))
 
-    for turn in reversed(turns):
+    # Index of the last database turn — it's the only one we attach a result
+    # preview to (keeps tokens bounded; older turns just keep their SQL).
+    last_db_idx = next(
+        (i for i in range(len(ordered) - 1, -1, -1) if ordered[i].route == "database"),
+        -1,
+    )
+
+    for i, turn in enumerate(ordered):
         lines.append(f"User: {turn.message.strip()}")
-
         if turn.answer:
-            lines.append(
-                f"Assistant ({turn.route}): {turn.answer.strip()}"
-            )
+            lines.append(f"Assistant ({turn.route}): {turn.answer.strip()}")
 
         if light or turn.route != "database":
             continue
@@ -637,9 +657,28 @@ def user_message_with_history(
         if turn.generated_sql:
             lines.append(f"SQL used:\n{turn.generated_sql.strip()}")
 
-    history = "\n".join(lines)
+        # Attach a short result preview ONLY for the most recent DB turn.
+        if i == last_db_idx and turn.sql_result_raw:
+            preview = _format_result_preview(turn.sql_result_raw)
+            if preview:
+                lines.append(f"Result of the SQL above (first rows):\n{preview}")
 
+    history = "\n".join(lines)
     return f"{history}\n\nCurrent question:\n{message}"
+
+
+def _format_result_preview(rows: Any, max_rows: int = 10) -> str:
+    """Render the prior SQL result as a compact JSON list for the LLM.
+
+    Keeps it small: at most ``max_rows`` rows, no nested objects.
+    """
+    try:
+        if not isinstance(rows, list) or not rows:
+            return ""
+        preview = rows[:max_rows]
+        return json.dumps(preview, default=str, ensure_ascii=False)
+    except Exception:
+        return ""
 
 
 # =============================================================================
@@ -1334,7 +1373,6 @@ def create_reply(*, conv_id: str, message: str, sender: str = "user"):
         yield {"type": "status", "stage": "executing"}
         try:
             rows = execute_sql(sql)
-            break  # success
         except Exception as exc:
             if attempt >= settings.CHATBOT_MAX_RETRIES:
                 logger.exception("SQL execution failed after retries")
@@ -1343,6 +1381,33 @@ def create_reply(*, conv_id: str, message: str, sender: str = "user"):
             feedback = build_sql_error_feedback(str(exc), sql, rejected_columns, catalog)
             continue
 
+        # SQL executed cleanly — but if it returned NO ROWS and we still have
+        # retry budget, ask the model to try again with feedback about WHY
+        # the prior SQL was empty. Common causes: wrong JOIN keys, wrong
+        # table, or an over-strict WHERE filter the user did not request.
+        if not rows and not is_no_matching_schema(rows) and attempt < settings.CHATBOT_MAX_RETRIES:
+            logger.info("[empty-rows retry] attempt=%d sql=%s", attempt, sql[:120])
+            feedback = (
+                "The previous SQL ran but returned 0 rows. Look at the SQL "
+                "below and reconsider:\n"
+                "  • Are the JOIN keys correct? Column names that LOOK similar "
+                "(e.g. Product_ID vs Product_Item_ID, product_id vs "
+                "product_item_id) are usually NOT the same column. Read the "
+                "FK description in the catalog and use the EXACT join key it "
+                "names.\n"
+                "  • Did you filter on a column that doesn't actually exist "
+                "in the joined table, or with a value that doesn't exist in "
+                "the data?\n"
+                "  • If the user asked for a name/description, do NOT drop the "
+                "JOIN to the lookup table — fix the join key instead.\n"
+                "  • If the user asked for a measure, try the most populated "
+                "base table for that measure instead.\n\n"
+                f"Previous SQL that returned 0 rows:\n{sql}"
+            )
+            continue
+
+        break  # success — non-empty rows
+
     if is_no_matching_schema(rows):
         yield {"type": "error", "message": "I could not find matching tables or columns in the database for that question."}
         return
@@ -1350,13 +1415,20 @@ def create_reply(*, conv_id: str, message: str, sender: str = "user"):
     # ─────────────────────────────────────────────────────────────────────
     # Context-bleed safety net.
     #
-    # If the contextual SQL returned 0 rows AND this is a follow-up turn
-    # (i.e. we DID feed conversation history into the SQL prompt), retry
-    # ONCE with no history. Catches the common case where a new subject
+    # If the contextual SQL returned 0 rows AND this is a follow-up turn,
+    # retry ONCE with no history — catches the case where a new subject
     # gets the previous turn's tables/filters glued onto it.
+    #
+    # BUT skip the retry when the question is clearly REFERENCING the prior
+    # turn ("these", "those", "the same"…), because dropping history would
+    # also drop the IDs the question depends on.
     # ─────────────────────────────────────────────────────────────────────
+    _msg = (message or "").lower()
+    references_prior = any(w in _msg for w in (
+        "these", "those", "the same", "above", "previous", "earlier", "the ids"
+    ))
     had_history = bool(conv_id) and ChatBot.objects.filter(conv_id=conv_id).exists()
-    if not rows and had_history:
+    if not rows and had_history and not references_prior:
         yield {"type": "status", "stage": "generating_sql", "attempt": "retry-clean"}
         try:
             clean_sql = generate_sql(
